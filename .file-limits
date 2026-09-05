@@ -1,0 +1,3 @@
+# Locally generated shared Cursor guidance is 22,875 characters. Retain an
+# explicit bounded budget without removing guidance or disabling the checks.
+max_rules_chars: 24000

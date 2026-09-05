@@ -29,6 +29,7 @@ create_exception!(
 const CHANGE_ADDED: u8 = 1;
 const CHANGE_MODIFIED: u8 = 2;
 const CHANGE_DELETED: u8 = 3;
+const RESCAN_REQUIRED_ERROR: &str = "filesystem events lost; rescan required";
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -100,6 +101,99 @@ macro_rules! wf_error {
     };
 }
 
+fn handle_event(
+    res: NotifyResult<Event>,
+    changes: &Arc<Mutex<HashSet<(u8, String)>>>,
+    error: &Arc<Mutex<Option<String>>>,
+    debug: bool,
+) {
+    match res {
+        Ok(event) => {
+            if event.need_rescan() {
+                *error.lock().unwrap() = Some(RESCAN_REQUIRED_ERROR.to_string());
+                return;
+            }
+
+            if let Some(path_buf) = event.paths.first() {
+                let path = match path_buf.to_str() {
+                    Some(s) => s.to_string(),
+                    None => {
+                        let msg = format!("Unable to decode path {:?} to string", path_buf);
+                        *error.lock().unwrap() = Some(msg);
+                        return;
+                    }
+                };
+                let change = match event.kind {
+                    EventKind::Create(_) => CHANGE_ADDED,
+                    EventKind::Modify(ModifyKind::Metadata(_))
+                    | EventKind::Modify(ModifyKind::Data(_))
+                    | EventKind::Modify(ModifyKind::Other)
+                    | EventKind::Modify(ModifyKind::Any) => {
+                        // these events sometimes happen when creating files and deleting them, hence these checks
+                        let changes = changes.lock().unwrap();
+                        if changes.contains(&(CHANGE_DELETED, path.clone()))
+                            || changes.contains(&(CHANGE_ADDED, path.clone()))
+                        {
+                            // file was already deleted or file was added in this batch, ignore this event
+                            return;
+                        } else {
+                            CHANGE_MODIFIED
+                        }
+                    }
+                    EventKind::Modify(ModifyKind::Name(RenameMode::From)) => CHANGE_DELETED,
+                    EventKind::Modify(ModifyKind::Name(RenameMode::To)) => CHANGE_ADDED,
+                    // RenameMode::Both duplicates RenameMode::From & RenameMode::To
+                    EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => return,
+                    EventKind::Modify(ModifyKind::Name(_)) => {
+                        // On macOS the modify name event is triggered when a file is renamed,
+                        // but no information about whether it's the src or dst path is available.
+                        // Hence we have to check if the file exists instead.
+                        if Path::new(&path).exists() {
+                            CHANGE_ADDED
+                        } else {
+                            CHANGE_DELETED
+                        }
+                    }
+                    EventKind::Remove(_) => CHANGE_DELETED,
+                    event_kind => {
+                        if debug {
+                            eprintln!(
+                                "raw-event={:?} event.kind={:?} no change detected",
+                                event_kind, event_kind
+                            );
+                        }
+                        return;
+                    }
+                };
+                if debug {
+                    eprintln!("raw-event={:?} change={:?}", event, change);
+                }
+                changes.lock().unwrap().insert((change, path));
+            } else if debug {
+                eprintln!("raw-event={:?} no paths found", event);
+            }
+        }
+        Err(e) => {
+            if debug {
+                eprintln!("raw-error={:?} error.kind={:?} error.paths={:?}", e, e.kind, e.paths);
+            }
+            // see https://github.com/samuelcolvin/watchfiles/issues/282
+            // if we have IO errors from files not found, we return "file deleted", rather than the error
+            if let NotifyErrorKind::Io(io_error) = &e.kind {
+                if io_error.kind() == IOErrorKind::NotFound {
+                    changes.lock().unwrap().extend(
+                        e.paths
+                            .iter()
+                            .map(|p| (CHANGE_DELETED, p.to_string_lossy().to_string())),
+                    );
+                    return;
+                }
+            }
+            *error.lock().unwrap() = Some(format!("error in underlying watcher: {}", e));
+        }
+    }
+}
+
 #[pymethods]
 impl RustNotify {
     #[new]
@@ -117,86 +211,7 @@ impl RustNotify {
         let changes_clone = changes.clone();
         let error_clone = error.clone();
 
-        let event_handler = move |res: NotifyResult<Event>| match res {
-            Ok(event) => {
-                if let Some(path_buf) = event.paths.first() {
-                    let path = match path_buf.to_str() {
-                        Some(s) => s.to_string(),
-                        None => {
-                            let msg = format!("Unable to decode path {:?} to string", path_buf);
-                            *error_clone.lock().unwrap() = Some(msg);
-                            return;
-                        }
-                    };
-                    let change = match event.kind {
-                        EventKind::Create(_) => CHANGE_ADDED,
-                        EventKind::Modify(ModifyKind::Metadata(_))
-                        | EventKind::Modify(ModifyKind::Data(_))
-                        | EventKind::Modify(ModifyKind::Other)
-                        | EventKind::Modify(ModifyKind::Any) => {
-                            // these events sometimes happen when creating files and deleting them, hence these checks
-                            let changes = changes_clone.lock().unwrap();
-                            if changes.contains(&(CHANGE_DELETED, path.clone()))
-                                || changes.contains(&(CHANGE_ADDED, path.clone()))
-                            {
-                                // file was already deleted or file was added in this batch, ignore this event
-                                return;
-                            } else {
-                                CHANGE_MODIFIED
-                            }
-                        }
-                        EventKind::Modify(ModifyKind::Name(RenameMode::From)) => CHANGE_DELETED,
-                        EventKind::Modify(ModifyKind::Name(RenameMode::To)) => CHANGE_ADDED,
-                        // RenameMode::Both duplicates RenameMode::From & RenameMode::To
-                        EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => return,
-                        EventKind::Modify(ModifyKind::Name(_)) => {
-                            // On macOS the modify name event is triggered when a file is renamed,
-                            // but no information about whether it's the src or dst path is available.
-                            // Hence we have to check if the file exists instead.
-                            if Path::new(&path).exists() {
-                                CHANGE_ADDED
-                            } else {
-                                CHANGE_DELETED
-                            }
-                        }
-                        EventKind::Remove(_) => CHANGE_DELETED,
-                        event_kind => {
-                            if debug {
-                                eprintln!(
-                                    "raw-event={:?} event.kind={:?} no change detected",
-                                    event_kind, event_kind
-                                );
-                            }
-                            return;
-                        }
-                    };
-                    if debug {
-                        eprintln!("raw-event={:?} change={:?}", event, change);
-                    }
-                    changes_clone.lock().unwrap().insert((change, path));
-                } else if debug {
-                    eprintln!("raw-event={:?} no paths found", event);
-                }
-            }
-            Err(e) => {
-                if debug {
-                    eprintln!("raw-error={:?} error.kind={:?} error.paths={:?}", e, e.kind, e.paths);
-                }
-                // see https://github.com/samuelcolvin/watchfiles/issues/282
-                // if we have IO errors from files not found, we return "file deleted", rather than the error
-                if let NotifyErrorKind::Io(io_error) = &e.kind {
-                    if io_error.kind() == IOErrorKind::NotFound {
-                        changes_clone.lock().unwrap().extend(
-                            e.paths
-                                .iter()
-                                .map(|p| (CHANGE_DELETED, p.to_string_lossy().to_string())),
-                        );
-                        return;
-                    }
-                }
-                *error_clone.lock().unwrap() = Some(format!("error in underlying watcher: {}", e));
-            }
-        };
+        let event_handler = move |res: NotifyResult<Event>| handle_event(res, &changes_clone, &error_clone, debug);
         macro_rules! create_poll_watcher {
             ($msg_template:literal) => {{
                 if watch_paths.iter().any(|p| !Path::new(p).exists()) {
@@ -373,4 +388,50 @@ fn _rust_notify(py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     )?;
     m.add_class::<RustNotify>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::event::Flag;
+    use std::path::PathBuf;
+
+    fn event_state() -> (Arc<Mutex<HashSet<(u8, String)>>>, Arc<Mutex<Option<String>>>) {
+        (Arc::new(Mutex::new(HashSet::new())), Arc::new(Mutex::new(None)))
+    }
+
+    #[test]
+    fn rescan_event_without_paths_sets_error() {
+        let (changes, error) = event_state();
+        let event = Event::new(EventKind::Other).set_flag(Flag::Rescan);
+
+        handle_event(Ok(event), &changes, &error, false);
+
+        assert!(changes.lock().unwrap().is_empty());
+        assert_eq!(error.lock().unwrap().as_deref(), Some(RESCAN_REQUIRED_ERROR));
+    }
+
+    #[test]
+    fn rescan_event_with_path_sets_error_before_processing_path() {
+        let (changes, error) = event_state();
+        let event = Event::new(EventKind::Other)
+            .add_path(PathBuf::from("ignored.txt"))
+            .set_flag(Flag::Rescan);
+
+        handle_event(Ok(event), &changes, &error, false);
+
+        assert!(changes.lock().unwrap().is_empty());
+        assert_eq!(error.lock().unwrap().as_deref(), Some(RESCAN_REQUIRED_ERROR));
+    }
+
+    #[test]
+    fn unrelated_other_event_remains_ignored() {
+        let (changes, error) = event_state();
+        let event = Event::new(EventKind::Other).add_path(PathBuf::from("ignored.txt"));
+
+        handle_event(Ok(event), &changes, &error, false);
+
+        assert!(changes.lock().unwrap().is_empty());
+        assert!(error.lock().unwrap().is_none());
+    }
 }
